@@ -7,6 +7,15 @@
  * 便于后续单元测试与复用。
  */
 
+import {
+  buildSegmentCacheKey,
+  DEFAULT_CACHE_SETTINGS,
+  loadCacheSettings,
+  readCachedSegment,
+  recordSegmentProbe,
+  touchMeta,
+} from '@/lib/video-cache';
+
 /** 切集后延迟恢复弹幕可见性的毫秒数 */
 export const DANMAKU_VISIBLE_RESTORE_DELAY_MS = 1500;
 
@@ -63,7 +72,13 @@ export function filterAdsFromM3U8(m3u8Content: string): string {
 }
 
 /**
- * 计算播放源综合评分（分辨率 40% + 下载速度 40% + 网络延迟 20%）。
+ * 计算播放源综合评分。
+ *
+ * 权重：分辨率 60% + 下载速度 30% + 网络延迟 10%。
+ *
+ * 原则：**画质优先，但慢源降权**——高分辨率源优先；速度作为同档位内的
+ * 打破平局（同样 1080p 时选更快的），并把慢到会卡的源明显压低，避免
+ * 选到"分辨率高但卡成 PPT"的源。
  */
 export function calculateSourceScore(
   testResult: {
@@ -77,7 +92,7 @@ export function calculateSourceScore(
 ): number {
   let score = 0;
 
-  // 分辨率评分 (40% 权重)
+  // 分辨率评分 (60% 权重) —— 画质优先
   const qualityScore = (() => {
     switch (testResult.quality) {
       case '4K':
@@ -96,9 +111,9 @@ export function calculateSourceScore(
         return 0;
     }
   })();
-  score += qualityScore * 0.4;
+  score += qualityScore * 0.6;
 
-  // 下载速度评分 (40% 权重) - 基于最大速度线性映射
+  // 下载速度评分 (30% 权重) —— 达标加分 + 同档打破平局
   const speedScore = (() => {
     const speedStr = testResult.loadSpeed;
     if (speedStr === '未知' || speedStr === '测量中...') return 30;
@@ -115,9 +130,9 @@ export function calculateSourceScore(
     const speedRatio = speedKBps / maxSpeed;
     return Math.min(100, Math.max(0, speedRatio * 100));
   })();
-  score += speedScore * 0.4;
+  score += speedScore * 0.3;
 
-  // 网络延迟评分 (20% 权重) - 基于延迟范围线性映射
+  // 网络延迟评分 (10% 权重) - 基于延迟范围线性映射
   const pingScore = (() => {
     const ping = testResult.pingTime;
     if (ping <= 0) return 0; // 无效延迟给默认分
@@ -129,7 +144,7 @@ export function calculateSourceScore(
     const pingRatio = (maxPing - ping) / (maxPing - minPing);
     return Math.min(100, Math.max(0, pingRatio * 100));
   })();
-  score += pingScore * 0.2;
+  score += pingScore * 0.1;
 
   return Math.round(score * 100) / 100; // 保留两位小数
 }
@@ -335,35 +350,200 @@ export function createDanmakuInitialConfig(): any {
   };
 }
 
+export interface HlsLoaderOptions {
+  /** 是否过滤 m3u8 中的 #EXT-X-DISCONTINUITY（去广告） */
+  blockAd?: boolean;
+  /** 片段缓存键是否走同源代理，必须与 VideoPrefetcher 保持一致 */
+  useProxy?: boolean;
+  /** 缓存诊断回调（命中/未命中），用于观测缓存键是否与预取器一致 */
+  onProbe?: (hit: boolean) => void;
+}
+
 /**
- * 创建"去广告"自定义 HLS Loader。
+ * 合成 hls.js 的 LoaderStats。
  *
- * 在 manifest / level 请求成功后，对返回的 M3U8 内容执行广告过滤。
- * 仅在开启去广告功能时替换默认 Loader。
+ * 关键点：命中缓存时不能上报"耗时 0"。hls.js 的 ABR 用 EWMA 估算带宽，
+ * 0 延迟会被当成无限带宽，导致下一批片段直接判到最高码率而卡顿。
+ * 这里复用预取时记录的真实耗时，让带宽估算保持连续。
  */
-export function createCustomHlsLoader(Hls: any): any {
-  return class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
+function buildCachedStats(costMs: number, bytes: number): Record<string, unknown> {
+  const end = performance.now();
+  const span = Math.max(1, costMs);
+  const start = end - span;
+  const zero = { start: 0, first: 0, end: 0 };
+  return {
+    aborted: false,
+    loaded: bytes,
+    retry: 0,
+    total: bytes,
+    chunkCount: 1,
+    bwEstimate: (bytes / span) * 1000,
+    loading: { start, first: start + span * 0.6, end },
+    parsing: { ...zero },
+    buffering: { ...zero },
+  };
+}
+
+/**
+ * 创建「去广告 + 缓存优先」的 HLS Loader。
+ *
+ * - manifest / level：按需过滤 #EXT-X-DISCONTINUITY
+ * - fragment：先查 Cache Storage（由 VideoPrefetcher 预取填充），命中直接返回，
+ *   未命中再走原 loader 回源。因此缓存未命中时行为与默认 loader 完全一致。
+ */
+export function createCustomHlsLoader(
+  Hls: any,
+  options: HlsLoaderOptions = {}
+): any {
+  const BaseLoader = Hls.DefaultConfig.loader;
+  const useAdFilter = options.blockAd !== false;
+  const onProbe = options.onProbe ?? recordSegmentProbe;
+
+  /**
+   * 构建候选缓存键列表（按可能性先后排序）。
+   *  - 不再信任创建时快照的 useProxy：设置面板里切开关后，loader 和预取器
+   *    用的 format 可能不统一，因此两种 format 都生成，逐个试。
+   *  - 再叠加 readCachedSegment 内部的「相对路径/绝对 URL」双重兜底，
+   *    基本能覆盖所有 key 不一致的情况。
+   */
+  function candidateCacheKeys(contextUrl: string): string[] {
+    const liveSettings =
+      typeof window !== 'undefined' ? loadCacheSettings() : DEFAULT_CACHE_SETTINGS;
+    const preferredUseProxy =
+      options.useProxy !== undefined ? options.useProxy : liveSettings.useProxy;
+    const urls = new Set<string>();
+    // 优先按当前偏好的 useProxy 生成，其次反过来兜底
+    urls.add(buildSegmentCacheKey(contextUrl, preferredUseProxy));
+    urls.add(buildSegmentCacheKey(contextUrl, !preferredUseProxy));
+    return Array.from(urls);
+  }
+
+  return class MoontvHlsLoader extends BaseLoader {
     constructor(config: any) {
       super(config);
-      const load = this.load.bind(this);
-      this.load = function (context: any, config: any, callbacks: any) {
-        if (
-          (context as any).type === 'manifest' ||
-          (context as any).type === 'level'
-        ) {
-          const onSuccess = callbacks.onSuccess;
-          callbacks.onSuccess = function (
-            response: any,
-            stats: any,
-            context: any
-          ) {
-            if (response.data && typeof response.data === 'string') {
-              response.data = filterAdsFromM3U8(response.data);
-            }
-            return onSuccess(response, stats, context, null);
-          };
+      const baseLoad = this.load.bind(this);
+      const baseAbort =
+        typeof this.abort === 'function' ? this.abort.bind(this) : null;
+      const baseDestroy =
+        typeof this.destroy === 'function' ? this.destroy.bind(this) : null;
+
+      // 基类是 any，成员无法直接推断，这里做一次显式断言。
+      // `stats` 是 hls.js 内部读取带宽估算的来源，必须就地更新。
+      const self = this as unknown as { stats: Record<string, unknown> };
+
+      // 缓存查询是异步的：若期间 hls.js 取消了这次加载（seek / 切码率 /
+      // 组件卸载），必须让后续的 onSuccess 与回源请求同时失效，
+      // 否则会发出一个没人接收的网络请求。
+      let cancelled = false;
+
+      this.abort = function () {
+        cancelled = true;
+        baseAbort?.();
+      };
+
+      this.destroy = function () {
+        cancelled = true;
+        baseDestroy?.();
+      };
+
+      this.load = function (context: any, cfg: any, callbacks: any) {
+        // hls.js 不同版本 loader 调用约定不一致，type/url 可能在 context 或 cfg 上：
+        //   - type: manifest / level / fragment
+        //   - url / uri: 实际请求地址
+        // 这里做一次健壮的字段探测。
+        const rawType =
+          (context && typeof context.type === 'string' ? context.type : undefined) ??
+          (cfg && typeof cfg.type === 'string' ? cfg.type : undefined);
+        const rawUrl =
+          (context && (typeof context.url === 'string' || typeof context.uri === 'string')
+            ? (context.url || context.uri)
+            : undefined) ??
+          (cfg && (typeof cfg.url === 'string' || typeof cfg.uri === 'string')
+            ? (cfg.url || cfg.uri)
+            : undefined);
+        const rangeStart = context?.rangeStart ?? cfg?.rangeStart;
+        const type: string | undefined = rawType as any;
+        const url = typeof rawUrl === 'string' ? rawUrl : '';
+
+        // ① 文本播放列表：去广告
+        if (type === 'manifest' || type === 'level') {
+          if (useAdFilter) {
+            const onSuccess = callbacks.onSuccess;
+            callbacks.onSuccess = function (
+              response: any,
+              stats: any,
+              ctx: any
+            ) {
+              if (response.data && typeof response.data === 'string') {
+                response.data = filterAdsFromM3U8(response.data);
+              }
+              return onSuccess(response, stats, ctx, null);
+            };
+          }
+          baseLoad(context, cfg, callbacks);
+          return;
         }
-        load(context, config, callbacks);
+
+        // ② 片段：缓存优先
+        //    - 真正需要跳过缓存的字节范围分片特征是：URL 完全相同、每次请求的字节区段不同。
+        //      但 hls.js 常把 rangeStart=0、rangeEnd=undefined 也传过来（语义就是整个文件），
+        //      这对 plist0.ts / plist1.ts 这种"每个分片一个独立 URL"的源站完全可以缓存。
+        //      所以只有 rangeStart > 0 才保守跳过；rangeStart == null / ==0 一律正常走缓存。
+        //    - 没有明确 type 时：用 URL 后缀/关键词启发式判断是不是视频/音频分片。
+        const looksLikeFragment =
+          /\.(ts|m4s|m4v|mp4|webm|aac|mp3)(\?|$)/i.test(url) ||
+          /segment|fragment|clip|part|chunk|frag|plist/i.test(url);
+        const treatAsFragment = type === 'fragment' || (!type && looksLikeFragment);
+        const isTrueByteRange =
+          rangeStart != null &&
+          (typeof rangeStart === 'number' ? rangeStart > 0 : String(rangeStart) !== '0');
+
+        if (
+          !treatAsFragment ||
+          isTrueByteRange ||
+          typeof caches === 'undefined'
+        ) {
+          baseLoad(context, cfg, callbacks);
+          return;
+        }
+
+        // 候选缓存键按 (useProxy=true/false) × (相对路径/绝对URL) 生成，
+        // 任何一个命中就算命中，解决设置切换 / 浏览器自动补全 origin 导致的不匹配。
+        const keys = candidateCacheKeys(url);
+
+        (async () => {
+          for (const cacheKey of keys) {
+            const res = await readCachedSegment(cacheKey);
+            if (!res) continue;
+            if (cancelled) return;
+
+            const { fragment, matchedKey } = res;
+
+            onProbe(true);
+            void touchMeta(matchedKey);
+
+            // 就地更新基础类的 stats，避免 hls.js 带宽估算失真
+            const stats = buildCachedStats(
+              fragment.costMs,
+              fragment.data.byteLength
+            );
+            Object.assign(self.stats, stats);
+
+            callbacks.onSuccess(
+              { url: context.url, data: fragment.data },
+              self.stats,
+              context
+            );
+            return;
+          }
+
+          // 所有候选键都没命中 → 走网络
+          if (cancelled) return;
+          onProbe(false);
+          baseLoad(context, cfg, callbacks);
+        })().catch(() => {
+          if (!cancelled) baseLoad(context, cfg, callbacks);
+        });
       };
     }
   };

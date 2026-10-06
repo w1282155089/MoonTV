@@ -4,15 +4,24 @@
 
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 
 import AddDownloadModal from '@/components/AddDownloadModal';
+import { BackButton } from '@/components/BackButton';
+import CacheManager from '@/components/CacheManager';
 import DanmakuSelector from '@/components/DanmakuSelector';
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
 
+import { PlayerOverlayHeader } from './components/PlayerOverlayHeader';
 import { ErrorView, LoadingView, VideoLoadingMask } from './components/PlayStatusView';
 import { VideoDetailPanel } from './components/VideoDetailPanel';
 import { usePlayEngine } from './usePlayEngine';
+
+/** 避免点到浮层时把点击传到 ArtPlayer（会误触发播放/暂停） */
+function stopPlayerPointer(event: { stopPropagation: () => void }) {
+  event.stopPropagation();
+}
 
 /**
  * 播放页客户端组件。
@@ -44,6 +53,7 @@ export default function PlayClient() {
     skipConfig,
     // 播放器
     artRef,
+    playerHost,
     isVideoLoading,
     videoLoadingStage,
     setLoading,
@@ -62,6 +72,9 @@ export default function PlayClient() {
     isDanmakuLoading,
     handleDanmakuSelect,
     handleDanmakuClose,
+    // 缓存管理
+    showCacheManager,
+    setShowCacheManager,
     // 收藏 / 追更
     favorited,
     following,
@@ -72,7 +85,14 @@ export default function PlayClient() {
   if (loading) {
     return (
       <PageLayout activePath='/play'>
-        <LoadingView stage={loadingStage} message={loadingMessage} />
+        {/* 加载态也留一个返回入口：搜错片/等太久不想等时能直接退出去。
+            用绝对定位覆盖，避免给整屏的加载视图额外撑出滚动条。 */}
+        <div className='relative'>
+          <div className='absolute left-3 top-3 z-10 lg:left-[5rem] lg:top-4 2xl:left-32'>
+            <BackButton showLabel />
+          </div>
+          <LoadingView stage={loadingStage} message={loadingMessage} />
+        </div>
       </PageLayout>
     );
   }
@@ -96,46 +116,79 @@ export default function PlayClient() {
 
   return (
     <PageLayout activePath='/play'>
-      <div className='flex flex-col px-0 lg:px-[5rem] 2xl:px-32'>
-        {/* 播放器和选集 */}
+      <div className='flex flex-col px-0'>
+        {/* 播放器和选集：顶对齐导航栏，左右铺满 */}
         <div>
           <div className='grid lg:h-[500px] xl:h-[650px] 2xl:h-[750px] grid-cols-1 md:grid-cols-4 md:gap-0'>
             {/* 播放器 */}
-            <div className='h-full border-0 md:border-t md:border-b md:border-l md:border-white/0 md:dark:border-white/30 md:col-span-3'>
+            <div className='h-full md:col-span-3'>
               <div className='relative w-full h-[300px] lg:h-full'>
                 <div
                   ref={artRef}
                   className='bg-black w-full h-full overflow-hidden shadow-lg'
                 ></div>
-
-                {/* 弹幕选择器 */}
-                {showDanmakuSelector && (
-                  <DanmakuSelector
-                    videoTitle={videoTitle}
-                    isVisible={showDanmakuSelector}
-                    currentEpisode={currentEpisodeIndex + 1}
-                    currentEpisodeTitle={
-                      detail?.episodes_titles?.[currentEpisodeIndex]
-                    }
-                    onSelect={handleDanmakuSelect}
-                    onClose={handleDanmakuClose}
-                  />
-                )}
-
-                {/* 换源加载蒙层 */}
-                <VideoLoadingMask
-                  visible={isVideoLoading}
-                  stage={videoLoadingStage}
-                />
-
-                {/* 弹幕加载提示 */}
-                {isDanmakuLoading && (
-                  <div className='absolute top-4 left-4 right-4 z-[400] flex justify-center'>
-                    <div className='bg-gray-800/90 text-white px-4 py-2 rounded-lg shadow-lg'>
-                      正在自动加载弹幕...
-                    </div>
-                  </div>
-                )}
+                {playerHost &&
+                  createPortal(
+                    <>
+                      <PlayerOverlayHeader
+                        title={
+                          videoTitle
+                            ? totalEpisodes > 1
+                              ? `${videoTitle} · 第 ${currentEpisodeIndex + 1} 集`
+                              : videoTitle
+                            : ''
+                        }
+                      />
+                      {/* 弹幕选择器 / 缓存管理 / 提示：挂进播放器节点，网页全屏与原生全屏都能看见 */}
+                      {showDanmakuSelector && (
+                        <div
+                          className='moontv-player-modal'
+                          onClick={stopPlayerPointer}
+                          onMouseDown={stopPlayerPointer}
+                        >
+                          <DanmakuSelector
+                            videoTitle={videoTitle}
+                            isVisible={showDanmakuSelector}
+                            currentEpisode={currentEpisodeIndex + 1}
+                            currentEpisodeTitle={
+                              detail?.episodes_titles?.[currentEpisodeIndex]
+                            }
+                            onSelect={handleDanmakuSelect}
+                            onClose={handleDanmakuClose}
+                          />
+                        </div>
+                      )}
+                      <div
+                        onClick={stopPlayerPointer}
+                        onMouseDown={stopPlayerPointer}
+                      >
+                        <VideoLoadingMask
+                          visible={isVideoLoading}
+                          stage={videoLoadingStage}
+                        />
+                      </div>
+                      {isDanmakuLoading && (
+                        <div className='pointer-events-none absolute left-4 right-4 top-16 z-[400] flex justify-center'>
+                          <div className='rounded-lg bg-gray-800/90 px-4 py-2 text-white shadow-lg'>
+                            正在自动加载弹幕...
+                          </div>
+                        </div>
+                      )}
+                      {showCacheManager && (
+                        <div
+                          className='moontv-player-modal'
+                          onClick={stopPlayerPointer}
+                          onMouseDown={stopPlayerPointer}
+                        >
+                          <CacheManager
+                            isOpen={showCacheManager}
+                            onClose={() => setShowCacheManager(false)}
+                          />
+                        </div>
+                      )}
+                    </>,
+                    playerHost
+                  )}
               </div>
             </div>
 
@@ -164,22 +217,24 @@ export default function PlayClient() {
         </div>
 
         {/* 详情展示 */}
-        <VideoDetailPanel
-          videoTitle={videoTitle}
-          videoYear={videoYear}
-          totalEpisodes={totalEpisodes}
-          currentEpisodeIndex={currentEpisodeIndex}
-          detail={detail}
-          favorited={favorited}
-          following={following}
-          onToggleFavorite={handleToggleFavorite}
-          onToggleFollowing={handleToggleFollowing}
-          videoUrl={videoUrl}
-          videoDoubanId={videoDoubanId}
-          currentSource={currentSource}
-          currentId={currentId}
-          onDownload={() => setShowAddDownload(true)}
-        />
+        <div className='px-0 lg:px-[5rem] 2xl:px-32 mt-4 md:mt-6 xl:mt-8'>
+          <VideoDetailPanel
+            videoTitle={videoTitle}
+            videoYear={videoYear}
+            totalEpisodes={totalEpisodes}
+            currentEpisodeIndex={currentEpisodeIndex}
+            detail={detail}
+            favorited={favorited}
+            following={following}
+            onToggleFavorite={handleToggleFavorite}
+            onToggleFollowing={handleToggleFollowing}
+            videoUrl={videoUrl}
+            videoDoubanId={videoDoubanId}
+            currentSource={currentSource}
+            currentId={currentId}
+            onDownload={() => setShowAddDownload(true)}
+          />
+        </div>
       </div>
 
       {/* 添加下载弹窗 */}
@@ -196,6 +251,12 @@ export default function PlayClient() {
           setShowAddDownload(false);
         }}
         initialUrl={videoUrl || ''}
+        episodes={(detail?.episodes || []).map((url, i) => ({
+          url,
+          title: `${videoTitle}_${detail?.episodes_titles?.[i] || `第${i + 1}集`}`,
+          label: detail?.episodes_titles?.[i] || `第${i + 1}集`,
+        }))}
+        currentEpisodeIndex={currentEpisodeIndex}
         initialTitle={`${videoTitle}${
           totalEpisodes > 1
             ? `_${detail?.episodes_titles?.[currentEpisodeIndex] || `第${currentEpisodeIndex + 1}集`}`
